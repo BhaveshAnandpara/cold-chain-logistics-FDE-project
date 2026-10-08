@@ -1,36 +1,45 @@
-"""Load the raw supply chain CSV into Azure SQL Database.
+"""Load the supply chain CSV into the legacy fleet-history table.
 
 Usage:
-    .venv\\Scripts\\python data-ingestion\\scripts\\ingest_to_azure_sql.py
+    .venv312\\Scripts\\python data-ingestion\\scripts\\ingest_to_azure_sql.py
 
-Reads connection settings from .env (see .env.example). The target table is
-dropped and recreated on every run, so the script is safe to re-run.
+Reads Azure SQL connection settings from the repository-root .env. The target
+table is replaced on every run.
 """
 
-import csv
 import os
 import sys
-import time
-from datetime import datetime
+import urllib.parse
 from pathlib import Path
 
+import pandas as pd
 import pyodbc
+from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 
 INGESTION_DIR = Path(__file__).resolve().parent.parent
 ROOT = INGESTION_DIR.parent
 CSV_PATH = INGESTION_DIR / "data" / "raw" / "dynamic_supply_chain_logistics_dataset.csv"
-TABLE = "dbo.supply_chain_logistics"
+TABLE = "TBL_SC_FLEET_HIST_RAW"
 DRIVER = "ODBC Driver 18 for SQL Server"
-BATCH_SIZE = 5000
+CHUNKSIZE = 5000
+LEGACY_MAPPING = {
+    "timestamp": "TS_UTC",
+    "vehicle_gps_latitude": "V_LAT",
+    "vehicle_gps_longitude": "V_LON",
+    "iot_temperature": "IOT_TEMP_VAL_C",
+    "cargo_condition_status": "CGO_COND_CD",
+    "risk_classification": "RISK_CLS_TXT",
+    "delay_probability": "DELAY_PROB_DEC",
+    "port_congestion_level": "PRT_CNG_LVL",
+    "route_risk_level": "RT_RSK_IDX",
+}
 
-TEXT_COLUMNS = {"risk_classification": "VARCHAR(20)"}
-TIMESTAMP_COLUMN = "timestamp"
 
-
-def connect() -> pyodbc.Connection:
+def create_engine_for_database():
     load_dotenv(ROOT / ".env")
-    missing = [k for k in ("AZURE_SQL_SERVER", "AZURE_SQL_DATABASE", "AZURE_SQL_USER", "AZURE_SQL_PASSWORD") if not os.getenv(k)]
+    required = ("AZURE_SQL_SERVER", "AZURE_SQL_DATABASE", "AZURE_SQL_USER", "AZURE_SQL_PASSWORD")
+    missing = [key for key in required if not os.getenv(key)]
     if missing:
         sys.exit(f"Missing in .env: {', '.join(missing)}")
     if DRIVER not in pyodbc.drivers():
@@ -44,78 +53,41 @@ def connect() -> pyodbc.Connection:
         f"Pwd={{{os.environ['AZURE_SQL_PASSWORD']}}};"
         "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=60;"
     )
-
-    # A serverless database that auto-paused takes up to ~1 minute to resume,
-    # and connections fail with error 40613 while it wakes up. Anything else
-    # (firewall, bad password) won't fix itself, so fail fast on those.
-    for attempt in range(1, 6):
-        try:
-            return pyodbc.connect(conn_str)
-        except pyodbc.Error as exc:
-            message = str(exc)
-            if "(40615)" in message:
-                sys.exit("Blocked by the Azure SQL firewall. Add your current IP under "
-                         "SQL server -> Security -> Networking -> Firewall rules.\n" + message)
-            if "(18456)" in message:
-                sys.exit("Login failed. Check AZURE_SQL_USER / AZURE_SQL_PASSWORD in .env.")
-            if "(40613)" not in message or attempt == 5:
-                raise
-            print(f"Attempt {attempt}: database is resuming from auto-pause, retrying in 15s...")
-            time.sleep(15)
-
-
-def column_type(name: str) -> str:
-    if name == TIMESTAMP_COLUMN:
-        return "DATETIME2(0) NOT NULL"
-    return f"{TEXT_COLUMNS.get(name, 'FLOAT')} NOT NULL"
-
-
-def parse_row(header: list[str], row: list[str]) -> list:
-    values = []
-    for name, raw in zip(header, row):
-        if name == TIMESTAMP_COLUMN:
-            values.append(datetime.strptime(raw, "%Y-%m-%d %H:%M:%S"))
-        elif name in TEXT_COLUMNS:
-            values.append(raw)
-        else:
-            values.append(float(raw))
-    return values
+    params = urllib.parse.quote_plus(conn_str)
+    return create_engine(
+        f"mssql+pyodbc:///?odbc_connect={params}",
+        fast_executemany=True,
+        pool_pre_ping=True,
+    )
 
 
 def main() -> None:
-    with CSV_PATH.open(newline="", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        header = next(reader)
-        rows = [parse_row(header, r) for r in reader]
-    print(f"Read {len(rows):,} rows x {len(header)} columns from {CSV_PATH.name}")
+    print(f"Loading CSV from {CSV_PATH}...")
+    df = pd.read_csv(CSV_PATH)
+    df_legacy = df[list(LEGACY_MAPPING)].rename(columns=LEGACY_MAPPING)
+    df_legacy["SYS_INGEST_FLAG"] = "Y"
 
-    conn = connect()
-    cursor = conn.cursor()
-    cursor.fast_executemany = True
+    print("Connecting to Azure SQL database from .env...")
+    engine = create_engine_for_database()
+    try:
+        print(f"Ingesting {len(df_legacy):,} rows into dbo.{TABLE}...")
+        df_legacy.to_sql(
+            TABLE,
+            engine,
+            if_exists="replace",
+            index=False,
+            schema="dbo",
+            chunksize=CHUNKSIZE,
+        )
 
-    column_defs = ",\n    ".join(f"[{c}] {column_type(c)}" for c in header)
-    cursor.execute(f"DROP TABLE IF EXISTS {TABLE};")
-    cursor.execute(
-        f"CREATE TABLE {TABLE} (\n"
-        f"    id INT IDENTITY(1,1) PRIMARY KEY,\n"
-        f"    {column_defs}\n"
-        f");"
-    )
+        with engine.connect() as connection:
+            count = connection.execute(text(f"SELECT COUNT(*) FROM dbo.{TABLE}")).scalar_one()
+    finally:
+        engine.dispose()
 
-    insert_sql = (
-        f"INSERT INTO {TABLE} ({', '.join(f'[{c}]' for c in header)}) "
-        f"VALUES ({', '.join('?' for _ in header)})"
-    )
-    for start in range(0, len(rows), BATCH_SIZE):
-        cursor.executemany(insert_sql, rows[start:start + BATCH_SIZE])
-        print(f"  inserted {min(start + BATCH_SIZE, len(rows)):,} / {len(rows):,}")
-    conn.commit()
-
-    count = cursor.execute(f"SELECT COUNT(*) FROM {TABLE};").fetchone()[0]
-    conn.close()
-    if count != len(rows):
-        sys.exit(f"Row count mismatch: CSV has {len(rows):,}, table has {count:,}")
-    print(f"Done. {TABLE} now has {count:,} rows.")
+    if count != len(df_legacy):
+        sys.exit(f"Row count mismatch: CSV has {len(df_legacy):,}, table has {count:,}")
+    print(f"Legacy data ingestion complete. dbo.{TABLE} now has {count:,} rows.")
 
 
 if __name__ == "__main__":
