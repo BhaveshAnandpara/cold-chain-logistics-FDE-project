@@ -38,7 +38,7 @@ LEGACY_MAPPING = {
 
 def create_engine_for_database():
     load_dotenv(ROOT / ".env")
-    required = ("AZURE_SQL_SERVER", "AZURE_SQL_DATABASE", "AZURE_SQL_USER", "AZURE_SQL_PASSWORD")
+    required = ("AZURE_SQL_SERVER", "AZURE_SQL_DATABASE", "SQL_ADMIN_USER", "SQL_ADMIN_PASSWORD")
     missing = [key for key in required if not os.getenv(key)]
     if missing:
         sys.exit(f"Missing in .env: {', '.join(missing)}")
@@ -49,8 +49,8 @@ def create_engine_for_database():
         f"Driver={{{DRIVER}}};"
         f"Server=tcp:{os.environ['AZURE_SQL_SERVER']},1433;"
         f"Database={os.environ['AZURE_SQL_DATABASE']};"
-        f"Uid={os.environ['AZURE_SQL_USER']};"
-        f"Pwd={{{os.environ['AZURE_SQL_PASSWORD']}}};"
+        f"Uid={os.environ['SQL_ADMIN_USER']};"
+        f"Pwd={{{os.environ['SQL_ADMIN_PASSWORD']}}};"
         "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=60;"
     )
     params = urllib.parse.quote_plus(conn_str)

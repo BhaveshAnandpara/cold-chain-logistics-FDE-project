@@ -32,8 +32,8 @@ Set these values in `.env`:
 ```dotenv
 AZURE_SQL_SERVER=your-server.database.windows.net
 AZURE_SQL_DATABASE=your-database
-AZURE_SQL_USER=your-sql-login
-AZURE_SQL_PASSWORD=your-sql-password
+SQL_ADMIN_USER=your-sql-login
+SQL_ADMIN_PASSWORD=your-sql-password
 ```
 
 Do not commit `.env`; it is excluded by `.gitignore`. Keep the password private. The server value is the host name only, without `tcp:` or a port.
